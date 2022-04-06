@@ -30,6 +30,7 @@ from autoPyTorch.utils.common import dict_repr, replace_string_bool_to_bool
 from autoPyTorch.utils.hyperparameter_search_space_update import HyperparameterSearchSpaceUpdates
 from autoPyTorch.utils.logging_ import PicklableClientLogger, get_named_client_logger
 from autoPyTorch.utils.parallel import preload_modules
+from autoPyTorch.constants_forecasting import FORECASTING_BUDGET_TYPE
 
 
 def fit_predict_try_except_decorator(
@@ -93,32 +94,33 @@ class ExecuteTaFuncWithQueue(AbstractTAFunc):
     """
 
     def __init__(
-        self,
-        backend: Backend,
-        seed: int,
-        metric: autoPyTorchMetric,
-        cost_for_crash: float,
-        abort_on_first_run_crash: bool,
-        pynisher_context: str,
-        pipeline_config: Optional[Dict[str, Any]] = None,
-        initial_num_run: int = 1,
-        stats: Optional[Stats] = None,
-        run_obj: str = 'quality',
-        par_factor: int = 1,
-        output_y_hat_optimization: bool = True,
-        include: Optional[Dict[str, Any]] = None,
-        exclude: Optional[Dict[str, Any]] = None,
-        memory_limit: Optional[int] = None,
-        disable_file_output: bool = False,
-        init_params: Dict[str, Any] = None,
-        budget_type: str = None,
-        ta: Optional[Callable] = None,
-        logger_port: int = None,
-        all_supported_metrics: bool = True,
-        search_space_updates: Optional[HyperparameterSearchSpaceUpdates] = None
+            self,
+            backend: Backend,
+            seed: int,
+            metric: autoPyTorchMetric,
+            cost_for_crash: float,
+            abort_on_first_run_crash: bool,
+            pynisher_context: str,
+            pipeline_config: Optional[Dict[str, Any]] = None,
+            initial_num_run: int = 1,
+            stats: Optional[Stats] = None,
+            run_obj: str = 'quality',
+            par_factor: int = 1,
+            output_y_hat_optimization: bool = True,
+            include: Optional[Dict[str, Any]] = None,
+            exclude: Optional[Dict[str, Any]] = None,
+            memory_limit: Optional[int] = None,
+            disable_file_output: bool = False,
+            init_params: Dict[str, Any] = None,
+            budget_type: str = None,
+            ta: Optional[Callable] = None,
+            logger_port: int = None,
+            all_supported_metrics: bool = True,
+            search_space_updates: Optional[HyperparameterSearchSpaceUpdates] = None,
+            **eval_func_kwargs: Dict
     ):
 
-        eval_function = autoPyTorch.evaluation.train_evaluator.eval_function
+        eval_function = functools.partial(autoPyTorch.evaluation.train_evaluator.eval_function, **eval_func_kwargs)
 
         self.worst_possible_result = cost_for_crash
 
@@ -208,20 +210,27 @@ class ExecuteTaFuncWithQueue(AbstractTAFunc):
                     'If budget_type is None, budget must be.0, but is %f' % run_info.budget
                 )
         else:
-            if run_info.budget == 0:
-                # SMAC can return budget zero for intensifiers that don't have a concept
-                # of budget, for example a simple bayesian optimization intensifier.
-                # Budget determines how our pipeline trains, which can be via runtime or epochs
-                epochs_budget = self.pipeline_config.get('epochs', np.inf)
-                runtime_budget = self.pipeline_config.get('runtime', np.inf)
-                run_info = run_info._replace(budget=min(epochs_budget, runtime_budget))
-            elif run_info.budget <= 0:
-                raise ValueError('Illegal value for budget, must be greater than zero but is %f' %
-                                 run_info.budget)
-            if self.budget_type not in ('epochs', 'runtime'):
+            if self.budget_type in ('epochs', 'runtime'):
+                if run_info.budget == 0:
+                    # SMAC can return budget zero for intensifiers that don't have a concept
+                    # of budget, for example a simple bayesian optimization intensifier.
+                    # Budget determines how our pipeline trains, which can be via runtime or epochs
+                    epochs_budget = self.pipeline_config.get('epochs', np.inf)
+                    runtime_budget = self.pipeline_config.get('runtime', np.inf)
+                    run_info = run_info._replace(budget=min(epochs_budget, runtime_budget))
+                elif run_info.budget <= 0 or run_info.budget > 100:
+                    raise ValueError('Illegal value for budget, must be >0 and <=100, but is %f' %
+                                     run_info.budget)
+            elif self.budget_type in FORECASTING_BUDGET_TYPE:
+                if run_info.budget == 0:
+                    run_info = run_info._replace(budget=1.0)
+                elif run_info.budget <= 0 or run_info.budget > 1.:
+                    raise ValueError('Illegal value for budget, must be >0 and <=100, but is %f' %
+                                     run_info.budget)
+            else:
                 raise ValueError("Illegal value for budget type, must be one of "
-                                 "('epochs', 'runtime'), but is : %s" %
-                                 self.budget_type)
+                                 f"('epochs', 'runtime', or {FORECASTING_BUDGET_TYPE} (for forecasting tasks)), "
+                                 f"but is : {self.budget_type}")
 
         remaining_time = self.stats.get_remaing_time_budget()
 
@@ -279,7 +288,8 @@ class ExecuteTaFuncWithQueue(AbstractTAFunc):
             logger=logger,
             # Pynisher expects seconds as a time indicator
             wall_time_in_s=int(cutoff) if cutoff is not None else None,
-            mem_in_mb=self.memory_limit,
+            # TODO Figure out how pynisher influences GPU memory usage here
+            #mem_in_mb=self.memory_limit,
             capture_output=True,
             context=context,
         )

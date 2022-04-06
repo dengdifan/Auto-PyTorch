@@ -18,6 +18,7 @@ from autoPyTorch.pipeline.components.setup.network_head.base_network_head import
     NetworkHeadComponent,
 )
 
+
 directory = os.path.split(__file__)[0]
 _heads = find_components(__package__,
                          directory,
@@ -44,6 +45,7 @@ class NetworkHeadChoice(autoPyTorchChoice):
         components = OrderedDict()
         components.update(_heads)
         components.update(_addons.components)
+
         return components
 
     def get_available_components(
@@ -112,7 +114,6 @@ class NetworkHeadChoice(autoPyTorchChoice):
             # is not recommended for a certain dataset
 
             components_dict[name] = entry
-
         return components_dict
 
     def get_hyperparameter_search_space(
@@ -157,6 +158,7 @@ class NetworkHeadChoice(autoPyTorchChoice):
                 if default_ in available_heads:
                     default = default_
                     break
+
         updates = self._get_search_space_updates()
         if '__choice__' in updates.keys():
             choice_hyperparameter = updates['__choice__']

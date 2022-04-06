@@ -1,5 +1,7 @@
 from multiprocessing.queues import Queue
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, no_type_check, ClassVar
+
+import warnings
 
 from ConfigSpace.configuration_space import Configuration
 
@@ -21,6 +23,7 @@ from autoPyTorch.evaluation.abstract_evaluator import (
 from autoPyTorch.pipeline.components.training.metrics.base import autoPyTorchMetric
 from autoPyTorch.utils.common import dict_repr, subsampler
 from autoPyTorch.utils.hyperparameter_search_space_update import HyperparameterSearchSpaceUpdates
+
 
 __all__ = ['TrainEvaluator', 'eval_function']
 
@@ -363,7 +366,8 @@ class TrainEvaluator(AbstractEvaluator):
                                            self.y_train[train_indices])
 
         opt_pred = self.predict_function(subsampler(self.X_train, test_indices), pipeline,
-                                         self.y_train[train_indices])
+                                            self.y_train[train_indices])
+
 
         if self.X_valid is not None:
             valid_pred = self.predict_function(self.X_valid, pipeline,
@@ -378,7 +382,6 @@ class TrainEvaluator(AbstractEvaluator):
             test_pred = None
 
         return train_pred, opt_pred, valid_pred, test_pred
-
 
 # create closure for evaluating an algorithm
 def eval_function(
@@ -400,6 +403,8 @@ def eval_function(
         all_supported_metrics: bool = True,
         search_space_updates: Optional[HyperparameterSearchSpaceUpdates] = None,
         instance: str = None,
+        evaluator_class: Optional[AbstractEvaluator] = None,
+        **evaluator_kwargs,
 ) -> None:
     """
     This closure allows the communication between the ExecuteTaFuncWithQueue and the
@@ -462,8 +467,12 @@ def eval_function(
             with a single instance, being the provided X_train, y_train of a single dataset.
             This instance is a compatibility argument for SMAC, that is capable of working
             with multiple datasets at the same time.
+        evaluator_class (Optional[AbstractEvaluator]):
+            the class name of evaluator, when not specified, it is set as vanilla TrainEvaluator
     """
-    evaluator = TrainEvaluator(
+    if evaluator_class is None:
+        evaluator_class = TrainEvaluator
+    evaluator = evaluator_class(
         backend=backend,
         queue=queue,
         metric=metric,
@@ -480,6 +489,7 @@ def eval_function(
         logger_port=logger_port,
         all_supported_metrics=all_supported_metrics,
         pipeline_config=pipeline_config,
-        search_space_updates=search_space_updates
+        search_space_updates=search_space_updates,
+        **evaluator_kwargs
     )
     evaluator.fit_predict_and_loss()

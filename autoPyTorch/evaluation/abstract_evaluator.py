@@ -3,6 +3,7 @@ import time
 import warnings
 from multiprocessing.queues import Queue
 from typing import Any, Dict, List, Optional, Tuple, Union, no_type_check
+from functools import partial
 
 from ConfigSpace import Configuration
 
@@ -19,7 +20,9 @@ from smac.tae import StatusType
 import autoPyTorch.pipeline.image_classification
 import autoPyTorch.pipeline.tabular_classification
 import autoPyTorch.pipeline.tabular_regression
+import autoPyTorch.pipeline.time_series_classification
 import autoPyTorch.pipeline.traditional_tabular_classification
+import autoPyTorch.pipeline.time_series_forecasting
 import autoPyTorch.pipeline.traditional_tabular_regression
 from autoPyTorch.automl_common.common.utils.backend import Backend
 from autoPyTorch.constants import (
@@ -29,9 +32,12 @@ from autoPyTorch.constants import (
     REGRESSION_TASKS,
     STRING_TO_OUTPUT_TYPES,
     STRING_TO_TASK_TYPES,
-    TABULAR_TASKS,
+    TABULAR_TASKS, TIMESERIES_TASKS,
+    FORECASTING_TASKS,
 )
 from autoPyTorch.datasets.base_dataset import BaseDataset, BaseDatasetPropertiesType
+from autoPyTorch.datasets.time_series_dataset import TimeSeriesSequence
+
 from autoPyTorch.evaluation.utils import (
     VotingRegressorWrapper,
     convert_multioutput_multiclass_to_multilabel
@@ -46,6 +52,7 @@ from autoPyTorch.utils.common import dict_repr, subsampler
 from autoPyTorch.utils.hyperparameter_search_space_update import HyperparameterSearchSpaceUpdates
 from autoPyTorch.utils.logging_ import PicklableClientLogger, get_named_client_logger
 from autoPyTorch.utils.pipeline import get_dataset_requirements
+from autoPyTorch.constants_forecasting import FORECASTING_BUDGET_TYPE
 
 __all__ = [
     'AbstractEvaluator',
@@ -306,6 +313,47 @@ class DummyRegressionPipeline(DummyRegressor):
                 'runtime': 1}
 
 
+class DummyTimeSeriesForecastingPipeline(DummyClassificationPipeline):
+    def __init__(self, config: Configuration,
+                 random_state: Optional[Union[int, np.random.RandomState]] = None,
+                 init_params: Optional[Dict] = None,
+                 n_prediction_steps: int = 1,
+                 ) -> None:
+        super(DummyTimeSeriesForecastingPipeline, self).__init__(config, random_state, init_params)
+        self.n_prediction_steps = n_prediction_steps
+
+    def fit(self, X: Dict[str, Any], y: Any,
+            sample_weight: Optional[np.ndarray] = None) -> object:
+        self.n_prediction_steps = X['dataset_properties']['n_prediction_steps']
+        y_train = subsampler(X['y_train'], X['train_indices'])
+        return DummyClassifier.fit(self, np.ones((y_train.shape[0], 1)), y_train,sample_weight)
+
+    def _genreate_dummy_forecasting(self, X):
+        if isinstance(X[0], TimeSeriesSequence):
+            X_tail = [x.Y[-1 - self.n_prediction_steps] for x in X]
+        else:
+            X_tail = [x[-1] for x in X]
+        return X_tail
+
+    def predict_proba(self, X: Union[np.ndarray, pd.DataFrame],
+                      batch_size: int = 1000) -> np.array:
+        X_tail = self._genreate_dummy_forecasting(X)
+        return np.tile(X_tail, (1, self.n_prediction_steps)).astype(np.float32).squeeze()
+
+    def predict(self, X: Union[np.ndarray, pd.DataFrame],
+                batch_size: int = 1000) -> np.array:
+        X_tail = np.asarray(self._genreate_dummy_forecasting(X))
+        if X_tail.ndim == 1:
+            X_tail = np.expand_dims(X_tail, -1)
+        return np.tile(X_tail, (1, self.n_prediction_steps)).astype(np.float32).squeeze()
+
+    @staticmethod
+    def get_default_pipeline_options() -> Dict[str, Any]:
+        return {'budget_type': 'epochs',
+                'epochs': 1,
+                'runtime': 1}
+
+
 def fit_and_suppress_warnings(logger: PicklableClientLogger, pipeline: BaseEstimator,
                               X: Dict[str, Any], y: Any
                               ) -> BaseEstimator:
@@ -408,7 +456,7 @@ class AbstractEvaluator(object):
                  init_params: Optional[Dict[str, Any]] = None,
                  logger_port: Optional[int] = None,
                  all_supported_metrics: bool = True,
-                 search_space_updates: Optional[HyperparameterSearchSpaceUpdates] = None
+                 search_space_updates: Optional[HyperparameterSearchSpaceUpdates] = None,
                  ) -> None:
 
         self.starttime = time.time()
@@ -456,17 +504,21 @@ class AbstractEvaluator(object):
             raise ValueError('disable_file_output should be either a bool or a list')
 
         self.pipeline_class: Optional[Union[BaseEstimator, BasePipeline]] = None
+
         if self.task_type in REGRESSION_TASKS:
             if isinstance(self.configuration, int):
                 self.pipeline_class = DummyRegressionPipeline
             elif isinstance(self.configuration, str):
                 self.pipeline_class = MyTraditionalTabularRegressionPipeline
             elif isinstance(self.configuration, Configuration):
-                self.pipeline_class = autoPyTorch.pipeline.tabular_regression.TabularRegressionPipeline
+                if self.task_type in TABULAR_TASKS:
+                    self.pipeline_class = autoPyTorch.pipeline.tabular_regression.TabularRegressionPipeline
+                elif self.task_type in FORECASTING_TASKS:
+                    self.pipeline_class = autoPyTorch.pipeline.time_series_forecasting.TimeSeriesForecastingPipeline
             else:
                 raise ValueError('task {} not available'.format(self.task_type))
             self.predict_function = self._predict_regression
-        else:
+        elif self.task_type in CLASSIFICATION_TASKS:
             if isinstance(self.configuration, int):
                 self.pipeline_class = DummyClassificationPipeline
             elif isinstance(self.configuration, str):
@@ -479,9 +531,25 @@ class AbstractEvaluator(object):
                     self.pipeline_class = autoPyTorch.pipeline.tabular_classification.TabularClassificationPipeline
                 elif self.task_type in IMAGE_TASKS:
                     self.pipeline_class = autoPyTorch.pipeline.image_classification.ImageClassificationPipeline
+                elif self.task_type in TIMESERIES_TASKS:
+                    self.pipeline_class = \
+                        autoPyTorch.pipeline.time_series_classification.TimeSeriesClassificationPipeline
                 else:
                     raise ValueError('task {} not available'.format(self.task_type))
             self.predict_function = self._predict_proba
+        elif self.task_type in FORECASTING_TASKS:
+            if isinstance(self.configuration, int):
+                self.pipeline_class = DummyTimeSeriesForecastingPipeline
+            elif isinstance(self.configuration, str):
+                raise ValueError("Only tabular classifications tasks "
+                                 "are currently supported with traditional methods")
+            elif isinstance(self.configuration, Configuration):
+                self.pipeline_class = autoPyTorch.pipeline.time_series_forecasting.TimeSeriesForecastingPipeline
+            else:
+                raise ValueError('task {} not available'.format(self.task_type))
+            self.predict_function = self._predict_regression
+
+
         self.dataset_properties = self.datamanager.get_dataset_properties(
             get_dataset_requirements(info=self.datamanager.get_required_dataset_info(),
                                      include=self.include,
@@ -575,8 +643,21 @@ class AbstractEvaluator(object):
         elif self.budget_type == 'runtime':
             self.fit_dictionary['runtime'] = self.budget
             self.fit_dictionary.pop('epochs', None)
+        elif self.budget_type == 'resolution' and self.task_type in TIMESERIES_TASKS:
+            self.fit_dictionary['sample_interval'] = int(np.ceil(1.0 / self.budget))
+            self.fit_dictionary.pop('epochs', None)
+            self.fit_dictionary.pop('runtime', None)
+        elif self.budget_type == 'num_seq':
+            self.fit_dictionary['fraction_seq'] = self.budget
+            self.fit_dictionary.pop('epochs', None)
+            self.fit_dictionary.pop('runtime', None)
+        elif self.budget_type == 'num_sample_per_seq':
+            self.fit_dictionary['fraction_samples_per_seq'] = self.budget
+            self.fit_dictionary.pop('epochs', None)
+            self.fit_dictionary.pop('runtime', None)
         else:
-            raise ValueError(f"budget type must be `epochs` or `runtime`, but got {self.budget_type}")
+            raise ValueError(f"budget type must be `epochs` or `runtime` or {FORECASTING_BUDGET_TYPE} "
+                             f"(Only used in forecasting taskss), but got {self.budget_type}")
 
     def _get_pipeline(self) -> BaseEstimator:
         """
@@ -618,7 +699,7 @@ class AbstractEvaluator(object):
             raise ValueError("Invalid configuration entered")
         return pipeline
 
-    def _loss(self, y_true: np.ndarray, y_hat: np.ndarray) -> Dict[str, float]:
+    def _loss(self, y_true: np.ndarray, y_hat: np.ndarray, **loss_kwargs: Dict) -> Dict[str, float]:
         """SMAC follows a minimization goal, so the make_scorer
         sign is used as a guide to obtain the value to reduce.
         The calculate_loss internally translate a score function to
@@ -643,9 +724,8 @@ class AbstractEvaluator(object):
             metrics = self.additional_metrics
         else:
             metrics = [self.metric]
-
         return calculate_loss(
-            y_true, y_hat, self.task_type, metrics)
+            y_true, y_hat, self.task_type, metrics, **loss_kwargs)
 
     def finish_up(self, loss: Dict[str, float], train_loss: Dict[str, float],
                   opt_pred: np.ndarray, valid_pred: Optional[np.ndarray],
@@ -691,7 +771,6 @@ class AbstractEvaluator(object):
             additional_info (Dict):
                 Additional run information, like train/test loss
         """
-
         self.duration = time.time() - self.starttime
 
         if file_output:

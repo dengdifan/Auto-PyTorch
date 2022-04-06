@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, List
 
 import numpy as np
 
@@ -10,12 +10,15 @@ from scipy.sparse import csr_matrix
 import torch
 from torch import nn
 
+import torchvision
+
 from autoPyTorch.pipeline.components.base_component import BaseEstimator
 from autoPyTorch.pipeline.components.base_component import (
     autoPyTorchComponent,
 )
 from autoPyTorch.pipeline.components.setup.network_backbone.utils import get_output_shape
 from autoPyTorch.utils.common import FitRequirement
+from autoPyTorch.constants import TIMESERIES_FORECASTING, TASK_TYPES_TO_STRING
 
 
 class NetworkBackboneComponent(autoPyTorchComponent):
@@ -42,7 +45,6 @@ class NetworkBackboneComponent(autoPyTorchComponent):
     def fit(self, X: Dict[str, Any], y: Any = None) -> BaseEstimator:
         """
         Builds the backbone component and assigns it to self.backbone
-
         Args:
             X (X: Dict[str, Any]): Dependencies needed by current component to perform fit
             y (Any): not used. To comply with sklearn API
@@ -123,3 +125,4 @@ class NetworkBackboneComponent(autoPyTorchComponent):
             str: Name of the backbone
         """
         return str(cls.get_properties()["shortname"])
+

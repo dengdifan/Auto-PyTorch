@@ -9,9 +9,12 @@ from ConfigSpace.configuration_space import Configuration
 import dask.distributed
 
 from smac.facade.smac_ac_facade import SMAC4AC
+from smac.facade.smac_hpo_facade import SMAC4HPO
+from smac.facade.roar_facade import ROAR
 from smac.intensification.hyperband import Hyperband
+from smac.intensification.intensification import Intensifier
 from smac.runhistory.runhistory import RunHistory
-from smac.runhistory.runhistory2epm import RunHistory2EPM4LogCost
+from smac.runhistory.runhistory2epm import RunHistory2EPM4LogCost, RunHistory2EPM4LogScaledCost
 from smac.scenario.scenario import Scenario
 from smac.tae.dask_runner import DaskParallelRunner
 from smac.tae.serial_runner import SerialRunner
@@ -26,23 +29,27 @@ from autoPyTorch.datasets.resampling_strategy import (
 )
 from autoPyTorch.ensemble.ensemble_builder import EnsembleBuilderManager
 from autoPyTorch.evaluation.tae import ExecuteTaFuncWithQueue, get_cost_of_crash
-from autoPyTorch.optimizer.utils import read_return_initial_configurations
+from autoPyTorch.evaluation.time_series_forecasting_train_evaluator import TimeSeriesForecastingTrainEvaluator
+from autoPyTorch.optimizer.utils import read_return_initial_configurations, read_forecasting_init_configurations
+
 from autoPyTorch.pipeline.components.training.metrics.base import autoPyTorchMetric
 from autoPyTorch.utils.hyperparameter_search_space_update import HyperparameterSearchSpaceUpdates
 from autoPyTorch.utils.logging_ import get_named_client_logger
 from autoPyTorch.utils.stopwatch import StopWatch
 
+from autoPyTorch.constants_forecasting import FORECASTING_BUDGET_TYPE
+
 
 def get_smac_object(
-    scenario_dict: Dict[str, Any],
-    seed: int,
-    ta: Callable,
-    ta_kwargs: Dict[str, Any],
-    n_jobs: int,
-    initial_budget: int,
-    max_budget: int,
-    dask_client: Optional[dask.distributed.Client],
-    initial_configurations: Optional[List[Configuration]] = None,
+        scenario_dict: Dict[str, Any],
+        seed: int,
+        ta: Callable,
+        ta_kwargs: Dict[str, Any],
+        n_jobs: int,
+        initial_budget: int,
+        max_budget: Union[int, float],
+        dask_client: Optional[dask.distributed.Client],
+        initial_configurations: Optional[List[Configuration]] = None,
 ) -> SMAC4AC:
     """
     This function returns an SMAC object that is gonna be used as
@@ -63,27 +70,80 @@ def get_smac_object(
         (SMAC4AC): sequential model algorithm configuration object
 
     """
-    intensifier = Hyperband
+    if initial_budget == max_budget:
+        intensifier = Intensifier
+        intensifier_kwargs = {'deterministic': True, }
+        rh2EPM = RunHistory2EPM4LogScaledCost
 
-    rh2EPM = RunHistory2EPM4LogCost
-    return SMAC4AC(
+    else:
+        intensifier = Hyperband
+        intensifier_kwargs = {'initial_budget': initial_budget, 'max_budget': max_budget,
+                              'eta': 3, 'min_chall': 1, 'instance_order': 'shuffle_once'}
+        rh2EPM = RunHistory2EPM4LogCost
+
+    return SMAC4HPO(
         scenario=Scenario(scenario_dict),
         rng=seed,
         runhistory2epm=rh2EPM,
         tae_runner=ta,
         tae_runner_kwargs=ta_kwargs,
         initial_configurations=initial_configurations,
+        initial_design=None,
         run_id=seed,
         intensifier=intensifier,
-        intensifier_kwargs={'initial_budget': initial_budget, 'max_budget': max_budget,
-                            'eta': 3, 'min_chall': 1, 'instance_order': 'shuffle_once'},
+        intensifier_kwargs=intensifier_kwargs,
+        dask_client=dask_client,
+        n_jobs=n_jobs,
+    )
+
+
+def get_roar_object(
+        scenario_dict: Dict[str, Any],
+        seed: int,
+        ta: Callable,
+        ta_kwargs: Dict[str, Any],
+        n_jobs: int,
+        initial_budget: int,
+        max_budget: Union[int, float],
+        dask_client: Optional[dask.distributed.Client],
+        initial_configurations: Optional[List[Configuration]] = None,
+) -> SMAC4AC:
+    """
+    This function returns an SMAC object that is gonna be used as
+    optimizer of pipelines
+
+    Args:
+        scenario_dict (Dict[str, Any]): constrain on how to run
+            the jobs
+        seed (int): to make the job deterministic
+        ta (Callable): the function to be intensifier by smac
+        ta_kwargs (Dict[str, Any]): Arguments to the above ta
+        n_jobs (int): Amount of cores to use for this task
+        dask_client (dask.distributed.Client): User provided scheduler
+        initial_configurations (List[Configuration]): List of initial
+            configurations which smac will run before starting the search process
+
+    Returns:
+        (SMAC4AC): sequential model algorithm configuration object
+
+    """
+    intensifier = Intensifier
+    intensifier_kwargs = {'deterministic': True, }
+
+    return ROAR(
+        scenario=Scenario(scenario_dict),
+        rng=seed,
+        tae_runner=ta,
+        tae_runner_kwargs=ta_kwargs,
+        run_id=seed,
+        intensifier=intensifier,
+        intensifier_kwargs=intensifier_kwargs,
         dask_client=dask_client,
         n_jobs=n_jobs,
     )
 
 
 class AutoMLSMBO(object):
-
     def __init__(self,
                  config_space: ConfigSpace.ConfigurationSpace,
                  dataset_name: str,
@@ -113,6 +173,8 @@ class AutoMLSMBO(object):
                  pynisher_context: str = 'spawn',
                  min_budget: int = 5,
                  max_budget: int = 50,
+                 time_series_forecasting: bool = False,
+                 **kwargs: Dict[str, Any]
                  ):
         """
         Interface to SMAC. This method calls the SMAC optimize method, and allows
@@ -187,6 +249,11 @@ class AutoMLSMBO(object):
                 max_budget states the maximum resource allocation a pipeline is going to
                 be ran. For example, if the budget_type is epochs, and max_budget=50,
                 then the pipeline training will be terminated after 50 epochs.
+            time_series_forecasting (bool):
+                If we want to apply this optimizer to optimize time series prediction tasks (which has a different
+                tae)
+            kwargs (Dict):
+                Additional Arguments for forecasting intialization tasks
         """
         super(AutoMLSMBO, self).__init__()
         # data related
@@ -223,7 +290,12 @@ class AutoMLSMBO(object):
         self.exclude = exclude
         self.disable_file_output = disable_file_output
         self.smac_scenario_args = smac_scenario_args
-        self.get_smac_object_callback = get_smac_object_callback
+        if min_budget is None or max_budget is None:
+            self.get_smac_object_callback = get_roar_object
+            min_budget = 50
+            max_budget = 50
+        else:
+            self.get_smac_object_callback = get_smac_object_callback
         self.pynisher_context = pynisher_context
         self.min_budget = min_budget
         self.max_budget = max_budget
@@ -231,6 +303,8 @@ class AutoMLSMBO(object):
         self.ensemble_callback = ensemble_callback
 
         self.search_space_updates = search_space_updates
+
+        self.time_series_forecasting = time_series_forecasting
 
         if logger_port is None:
             self.logger_port = logging.handlers.DEFAULT_TCP_LOGGING_PORT
@@ -245,6 +319,19 @@ class AutoMLSMBO(object):
         if portfolio_selection is not None:
             self.initial_configurations = read_return_initial_configurations(config_space=config_space,
                                                                              portfolio_selection=portfolio_selection)
+        suggested_init_models: Optional[List[str]] = kwargs.get('suggested_init_models', None)
+        custom_init_setting_path: Optional[str] = kwargs.get('custom_init_setting_path', None)
+
+        # if suggested_init_models is an empty list, and  custom_init_setting_path is not provided, we
+        # do not provide any initial configurations
+        if suggested_init_models is None or suggested_init_models or custom_init_setting_path is not None:
+            self.initial_configurations = read_forecasting_init_configurations(
+                config_space=config_space,
+                suggested_init_models=suggested_init_models,
+                custom_init_setting_path=custom_init_setting_path)
+
+        if self.time_series_forecasting:
+            self.min_num_test_instances = kwargs.get('min_num_test_instances', None)
 
     def reset_data_manager(self) -> None:
         if self.datamanager is not None:
@@ -299,6 +386,7 @@ class AutoMLSMBO(object):
             search_space_updates=self.search_space_updates,
             pynisher_context=self.pynisher_context,
         )
+
         ta = ExecuteTaFuncWithQueue
         self.logger.info("Finish creating Target Algorithm (TA) function")
 
@@ -344,6 +432,18 @@ class AutoMLSMBO(object):
                         self.smac_scenario_args[arg]
                     )
             scenario_dict.update(self.smac_scenario_args)
+
+        budget_type = self.pipeline_config['budget_type']
+        if budget_type in FORECASTING_BUDGET_TYPE:
+            if self.min_budget > 1. or self.max_budget > 1.:
+                self.min_budget = self.min_budget / self.max_budget
+                self.max_budget = 1.0
+
+        if self.time_series_forecasting:
+            ta_kwargs["evaluator_class"] = TimeSeriesForecastingTrainEvaluator
+            ta_kwargs['max_budget'] = self.max_budget
+            ta_kwargs['min_num_test_instances'] = self.min_num_test_instances
+
 
         if self.get_smac_object_callback is not None:
             smac = self.get_smac_object_callback(scenario_dict=scenario_dict,
