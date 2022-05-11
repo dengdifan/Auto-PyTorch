@@ -1,2 +1,0 @@
-class ForbiddenValueError(ValueError):
-    pass
