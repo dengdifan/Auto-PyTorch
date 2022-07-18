@@ -1,3 +1,5 @@
+***As you might have noticed, the content of this branch is already integrated into [Auto-PyTorch 0.2.0](https://github.com/automl/Auto-PyTorch) and its [development branch](https://github.com/automl/Auto-PyTorch/tree/development). Please find our most recent updates there or install Auto-PyTorch forecasting directly via pip: `pip install autoPyTorch[forecasting] `***
+
 # Auto-PyTorch
 
 Copyright (C) 2021  [AutoML Groups Freiburg and Hannover](http://www.automl.org/)
